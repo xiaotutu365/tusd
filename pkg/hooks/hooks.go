@@ -26,9 +26,9 @@ import (
 	"golang.org/x/exp/slog"
 )
 
-// HookHandler is the main inferface to be implemented by all hook backends.
+// HookHandler is the main interface to be implemented by all hook backends.
 type HookHandler interface {
-	// Setup is invoked once the hook backend is initalized.
+	// Setup is invoked once the hook backend is initialized.
 	Setup() error
 	// InvokeHook is invoked for every hook that is executed. req contains the
 	// corresponding information about the hook type, the involved upload, and
@@ -91,10 +91,11 @@ const (
 	HookPostCreate    HookType = "post-create"
 	HookPreCreate     HookType = "pre-create"
 	HookPreFinish     HookType = "pre-finish"
+	HookPreDownload   HookType = "pre-download"
 )
 
 // AvailableHooks is a slice of all hooks that are implemented by tusd.
-var AvailableHooks []HookType = []HookType{HookPreCreate, HookPostCreate, HookPostReceive, HookPostTerminate, HookPostFinish, HookPreFinish}
+var AvailableHooks []HookType = []HookType{HookPreCreate, HookPostCreate, HookPostReceive, HookPostTerminate, HookPostFinish, HookPreFinish, HookPreDownload}
 
 func preCreateCallback(event handler.HookEvent, hookHandler HookHandler) (handler.HTTPResponse, handler.FileInfoChanges, error) {
 	ok, hookRes, err := invokeHookSync(HookPreCreate, event, hookHandler)
@@ -126,6 +127,29 @@ func preFinishCallback(event handler.HookEvent, hookHandler HookHandler) (handle
 
 	httpRes := hookRes.HTTPResponse
 	return httpRes, nil
+}
+
+// TODO 下载前置
+func preDownloadCallback(event handler.HookEvent, hookHandler HookHandler) (handler.HTTPResponse, handler.FileInfoChanges, error) {
+	ok, hookRes, err := invokeHookSync(HookPreDownload, event, hookHandler)
+	if !ok || err != nil {
+		return handler.HTTPResponse{}, handler.FileInfoChanges{}, err
+	}
+
+	httpRes := hookRes.HTTPResponse
+
+	// If the hook response includes the instruction to reject the upload, reuse the error code
+	// and message from ErrUploadRejectedByServer, but also include custom HTTP response values.
+	if hookRes.RejectUpload {
+		err := handler.ErrUploadRejectedByServer
+		err.HTTPResponse = err.HTTPResponse.MergeWith(httpRes)
+
+		return handler.HTTPResponse{}, handler.FileInfoChanges{}, err
+	}
+
+	// Pass any changes regarding file info from the hook to the handler.
+	changes := hookRes.ChangeFileInfo
+	return httpRes, changes, nil
 }
 
 func postReceiveCallback(event handler.HookEvent, hookHandler HookHandler) {
@@ -245,6 +269,12 @@ func NewHandlerWithHooks(config *handler.Config, hookHandler HookHandler, enable
 	if slices.Contains(enabledHooks, HookPreFinish) {
 		config.PreFinishResponseCallback = func(event handler.HookEvent) (handler.HTTPResponse, error) {
 			return preFinishCallback(event, hookHandler)
+		}
+	}
+	// TODO Install callback for pre-download hooks
+	if slices.Contains(enabledHooks, HookPreDownload) {
+		config.PreDownloadCreateCallback = func(event handler.HookEvent) (handler.HTTPResponse, handler.FileInfoChanges, error) {
+			return preDownloadCallback(event, hookHandler)
 		}
 	}
 

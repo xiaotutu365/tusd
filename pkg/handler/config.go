@@ -96,6 +96,9 @@ type Config struct {
 	// Under the hood, this is passed to ResponseController.SetReadDeadline
 	// Defaults to 60s
 	NetworkTimeout time.Duration
+	// TODO PreDownloadCreateCallback will be invoked before a new download is created, if the
+	// property is supplied.
+	PreDownloadCreateCallback func(hook HookEvent) (HTTPResponse, FileInfoChanges, error)
 }
 
 // CorsConfig provides a way to customize the the handling of Cross-Origin Resource Sharing (CORS).

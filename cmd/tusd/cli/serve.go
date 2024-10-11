@@ -98,6 +98,10 @@ func Serve() {
 
 		mux.Handle(basepathWithSlash, http.StripPrefix(basepathWithSlash, handler))
 		mux.Handle(basepathWithoutSlash, http.StripPrefix(basepathWithoutSlash, handler))
+
+		// TODO add batch download action
+		downloadPathWithSlash := basepathWithSlash + "/download"
+		mux.Handle(downloadPathWithSlash, http.StripPrefix(basepathWithoutSlash, handler))
 	}
 
 	if Flags.ExposeMetrics {

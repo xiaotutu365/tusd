@@ -50,6 +50,9 @@ func NewHandler(config Config) (*Handler, error) {
 		default:
 			// URL points to an upload resource
 			switch {
+			case method == "POST" && r.URL.Path == "download":
+				// Batch download
+				handler.GetBatchFile(w, r)
 			case method == "HEAD" && r.URL.Path != "":
 				// Offset retrieval
 				handler.HeadFile(w, r)

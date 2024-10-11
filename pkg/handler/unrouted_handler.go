@@ -1,14 +1,20 @@
 package handler
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"log"
 	"math"
 	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -988,6 +994,51 @@ func (handler *UnroutedHandler) GetFile(w http.ResponseWriter, r *http.Request) 
 		defer lock.Unlock()
 	}
 
+	// Parse metadata
+	meta := ParseMetadataHeader(r.Header.Get("Upload-Metadata"))
+
+	info2 := FileInfo{
+		MetaData: meta,
+	}
+
+	resp := HTTPResponse{
+		StatusCode: http.StatusCreated,
+		Header:     HTTPHeader{},
+	}
+
+	// TODO add pre-download callback
+	if handler.config.PreDownloadCreateCallback != nil {
+		resp2, changes, err := handler.config.PreDownloadCreateCallback(newHookEvent(c, info2))
+		if err != nil {
+			handler.sendError(c, err)
+			return
+		}
+		resp = resp.MergeWith(resp2)
+
+		// Apply changes returned from the pre-download hook.
+		if changes.ID != "" {
+			if err := validateUploadId(changes.ID); err != nil {
+				handler.sendError(c, err)
+				return
+			}
+
+			info2.ID = changes.ID
+		}
+
+		if changes.MetaData != nil {
+			info2.MetaData = changes.MetaData
+		}
+
+		if changes.Storage != nil {
+			info2.Storage = changes.Storage
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			handler.sendResp(c, resp)
+			return
+		}
+	}
+
 	upload, err := handler.composer.Core.GetUpload(c, id)
 	if err != nil {
 		handler.sendError(c, err)
@@ -1001,7 +1052,7 @@ func (handler *UnroutedHandler) GetFile(w http.ResponseWriter, r *http.Request) 
 	}
 
 	contentType, contentDisposition := filterContentType(info)
-	resp := HTTPResponse{
+	resp3 := HTTPResponse{
 		StatusCode: http.StatusOK,
 		Header: HTTPHeader{
 			"Content-Length":      strconv.FormatInt(info.Offset, 10),
@@ -1013,8 +1064,8 @@ func (handler *UnroutedHandler) GetFile(w http.ResponseWriter, r *http.Request) 
 
 	// If no data has been uploaded yet, respond with an empty "204 No Content" status.
 	if info.Offset == 0 {
-		resp.StatusCode = http.StatusNoContent
-		handler.sendResp(c, resp)
+		resp3.StatusCode = http.StatusNoContent
+		handler.sendResp(c, resp3)
 		return
 	}
 
@@ -1024,10 +1075,198 @@ func (handler *UnroutedHandler) GetFile(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	handler.sendResp(c, resp3)
+	io.Copy(w, src)
+
+	src.Close()
+}
+
+// GetBatchFile handles requests to download some files using a GET request.
+func (handler *UnroutedHandler) GetBatchFile(w http.ResponseWriter, r *http.Request) {
+	c := handler.getContext(w, r)
+
+	decoder := json.NewDecoder(r.Body)
+	var params map[string][]string
+	err := decoder.Decode(&params)
+	if err != nil {
+		handler.sendError(c, err)
+	}
+
+	var filePaths []string
+	for _, value := range params["ids"] {
+		id := value
+
+		upload, err := handler.composer.Core.GetUpload(c, id)
+		if err != nil {
+			handler.sendError(c, err)
+			return
+		}
+
+		info, err := upload.GetInfo(c)
+		if err != nil {
+			handler.sendError(c, err)
+			return
+		}
+
+		filePaths = append(filePaths, info.Storage["Path"])
+	}
+
+	// Parse metadata
+	meta := ParseMetadataHeader(r.Header.Get("Download-Metadata"))
+	zipFilename := meta["filename"]
+	// outputFilePath
+	outputFilePath := filepath.Join(filepath.Dir(filePaths[0]), zipFilename)
+
+	// start compress
+	compress(filePaths, outputFilePath, false)
+
+	c.log.Info("GetBatchFileStarted", "outputFilePath", outputFilePath)
+
+	// calculate file size
+	outputFileInfo, err := os.Stat(outputFilePath)
+	if err != nil {
+		c.log.Error("GetBatchFileError", "error", err)
+	}
+	outputFileSize := outputFileInfo.Size()
+
+	// response header
+	contentType := "application/x-zip-compressed"
+	contentDisposition := "attachment"
+
+	resp := HTTPResponse{
+		StatusCode: http.StatusOK,
+		Header: HTTPHeader{
+			"Content-Length":      strconv.FormatInt(outputFileSize, 10),
+			"Content-Type":        contentType,
+			"Content-Disposition": contentDisposition,
+		},
+		Body: "", // Body is intentionally left empty, and we copy it manually in later.
+	}
+
+	// If no data has been uploaded yet, respond with an empty "204 No Content" status.
+	if outputFileSize == 0 {
+		resp.StatusCode = http.StatusNoContent
+		handler.sendResp(c, resp)
+		return
+	}
+
+	src, err := os.Open(outputFilePath)
+	if err != nil {
+		handler.sendError(c, err)
+		return
+	}
+
 	handler.sendResp(c, resp)
 	io.Copy(w, src)
 
 	src.Close()
+}
+
+// compress can compress multiple files into one file
+func compress(srcPaths []string, outputPath string, useBasePathInZip bool) {
+	if len(srcPaths) == 0 {
+		return
+	}
+
+	file, openErr := os.OpenFile(outputPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if openErr != nil {
+		fmt.Printf("failed to open file %s: %v\n", outputPath, openErr)
+		return
+	}
+	defer file.Close()
+
+	zipWriter := zip.NewWriter(file)
+	defer zipWriter.Close()
+
+	for _, path := range srcPaths {
+		info, err := os.Stat(path)
+		if err != nil {
+			fmt.Printf("failed to stat file %s: %v\n", path, err)
+			return
+		}
+		if info.IsDir() {
+			fmt.Printf("%s is dir...\n", path)
+			err = addFilesToDirectory(zipWriter, path, "", useBasePathInZip)
+			if err != nil {
+				return
+			}
+			continue
+		}
+		fmt.Printf("%s is file...\n", path)
+		if err = compressFile(zipWriter, path, useBasePathInZip); err != nil {
+			log.Fatalf("add file %s to zip failed: %s", path, err)
+		}
+	}
+}
+
+func addFilesToDirectory(zw *zip.Writer, newDir, baseInZip string, useBasePathInZip bool) error {
+	files, err := ioutil.ReadDir(newDir)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("目录 %s 下包含 %d 个对象.\n", newDir, len(files))
+	var newBaseInZip string
+	for _, fileInfo := range files {
+		if useBasePathInZip {
+			newBaseInZip = filepath.Join(baseInZip, fileInfo.Name())
+		}
+		newFullPath := filepath.Join(newDir, fileInfo.Name())
+		fmt.Printf("\tcheck filename=%s, newFullPath=%s, newBaseInZip=%s \n", fileInfo.Name(), newFullPath, newBaseInZip)
+		// 是目录，递归处理
+		if fileInfo.IsDir() {
+			if err = addFilesToDirectory(zw, newFullPath, newBaseInZip, useBasePathInZip); err != nil {
+				return err
+			}
+			continue
+		}
+		// 处理单个文件
+		if err = compressFile(zw, newFullPath, useBasePathInZip); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func compressFile(zw *zip.Writer, srcFile string, useBasePathInZip bool) error {
+	fileToZip, err := os.Open(srcFile)
+	if err != nil {
+		log.Fatalf("compressFile failed to open %s: %v", srcFile, err)
+		return err
+	}
+	defer fileToZip.Close()
+
+	var zipFile io.Writer
+	if !useBasePathInZip {
+		// 获得源文件FileInfo对象
+		info, err := fileToZip.Stat()
+		if err != nil {
+			fmt.Printf("failed to open file %s: %v\n", srcFile, err)
+			return err
+		}
+		// 创建新的ZIP文件头，并设置其内部路径仅为文件名
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			fmt.Printf("failed to create file header for %s: %v\n", srcFile, err)
+			return err
+		}
+		fmt.Println("名称=", header.Name)
+		// 设置压缩后的文件名为源文件名（去掉路径）
+		header.Name = filepath.Base(srcFile)
+		// 基于主zw流创建该文件的目标zip平台
+		zipFile, err = zw.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+	} else {
+		zipFile, err = zw.Create(srcFile)
+		if err != nil {
+			return err
+		}
+	}
+	// 将源文件Copy到目标zip平台
+	_, err = io.Copy(zipFile, fileToZip)
+	fmt.Printf("压缩 %s 完成 %v\n", srcFile, err)
+	return err
 }
 
 // mimeInlineBrowserWhitelist is a map containing MIME types which should be
@@ -1061,7 +1300,7 @@ var mimeInlineBrowserWhitelist = map[string]struct{}{
 // Content-Disposition headers for a given upload. These values should be used
 // in responses for GET requests to ensure that only non-malicious file types
 // are shown directly in the browser. It will extract the file name and type
-// from the "fileame" and "filetype".
+// from the "filename" and "filetype".
 // See https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Disposition
 func filterContentType(info FileInfo) (contentType string, contentDisposition string) {
 	filetype := info.MetaData["filetype"]
