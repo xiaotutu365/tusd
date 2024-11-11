@@ -128,6 +128,7 @@ func ParseFlags() {
 		f.BoolVar(&Flags.S3DisableSSL, "s3-disable-ssl", false, "Disable SSL and only use HTTP for communication with S3 (experimental and may be removed in the future)")
 		f.IntVar(&Flags.S3ConcurrentPartUploads, "s3-concurrent-part-uploads", 10, "Number of concurrent part uploads to S3 (experimental and may be removed in the future)")
 		f.BoolVar(&Flags.S3TransferAcceleration, "s3-transfer-acceleration", false, "Use AWS S3 transfer acceleration endpoint (requires -s3-bucket option and Transfer Acceleration property on S3 bucket to be set)")
+		f.StringVar(&Flags.Basepath, "base-path", "/files/", "Basepath of the HTTP server")
 	})
 
 	fs.AddGroup("Google Cloud Storage options", func(f *flag.FlagSet) {

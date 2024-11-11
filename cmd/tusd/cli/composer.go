@@ -27,6 +27,7 @@ func CreateComposer() {
 	// Attempt to use S3 as a backend if the -s3-bucket option has been supplied.
 	// If not, we default to storing them locally on disk.
 	Composer = handler.NewStoreComposer()
+	// 判断Flags的类型，如果为S3Bucket，则存储在S3Bucket中；如果为Disk，则存储在本地磁盘中
 	if Flags.S3Bucket != "" {
 		// Derive credentials from default credential chain (env, shared, ec2 instance role)
 		// as per https://github.com/aws/aws-sdk-go#configuring-credentials
